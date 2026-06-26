@@ -1,0 +1,184 @@
+"""Held-out two-hop composition evaluation, degree stratification, and controls.
+
+Builds a held-out two-hop set where the BRIDGE edge (m, r2, t) is in valid/test
+(never in train) and the composite (h, r1.r2 -> t) is not a direct train edge.
+Scores the pure-geometry composed key against the entity codebook with filtered
+ranking, and reports against the popularity floor, stratified by r2 train-degree.
+"""
+from __future__ import annotations
+
+from collections import defaultdict, Counter
+import numpy as np
+
+
+def build_alltrue(train, valid, test):
+    at = defaultdict(set)
+    for h, r, t in np.vstack([train, valid, test]).tolist():
+        at[(int(h), int(r))].add(int(t))
+    return at
+
+
+def build_train_out(train):
+    """Train-only (h, r) -> {t} adjacency."""
+    out = defaultdict(set)
+    for h, r, t in train.tolist():
+        out[(int(h), int(r))].add(int(t))
+    return out
+
+
+def composite_in_train_closure(h, r1, r2, t, train_out):
+    """True if (h, r1, r2) -> t is reachable through ANY train middle (m2):
+       exists m2 in train_out[(h,r1)] with t in train_out[(m2,r2)].
+    This is the leak the bridge-edge gate alone does NOT catch."""
+    for m2 in train_out.get((int(h), int(r1)), ()):
+        if int(t) in train_out.get((int(m2), int(r2)), ()):
+            return True
+    return False
+
+
+def build_heldout_twohop(train, valid, test, alltrue, n=2500, seed=5,
+                         strict_composite=True):
+    """Sample held-out two-hop queries (h, r1, r2, t).
+
+    Always: bridge edge (m, r2, t) is NOT in train, and the composite is not a
+    known direct neighbour.
+
+    strict_composite=True (default in v5.1): additionally REJECT any query whose
+    composite target (h, r1, r2)->t is already reachable through some OTHER train
+    middle (the train 2-hop closure). This is the gate that makes the result a
+    test of generalization to genuinely-unseen composites rather than to held-out
+    bridge edges that may be memorizable via an alternate path.
+
+    Returns (Q, stats) where stats records how many were rejected by the gate.
+    """
+    rng = np.random.default_rng(seed)
+    trainset = {(int(h), int(r), int(t)) for h, r, t in train.tolist()}
+    train_out = build_train_out(train)
+    inadj = defaultdict(list)  # m -> [(r1, h)] from train
+    for h, r, t in train.tolist():
+        inadj[int(t)].append((int(r), int(h)))
+    held = [trip for trip in np.vstack([valid, test]).tolist()
+            if (int(trip[0]), int(trip[1]), int(trip[2])) not in trainset]
+    rng.shuffle(held)
+    Q = []
+    rejected_closure = 0
+    for m, r2, t in held:
+        pre = inadj.get(int(m))
+        if not pre:
+            continue
+        r1, h = pre[rng.integers(len(pre))]
+        if int(t) in alltrue.get((int(h), int(r1)), set()):
+            continue  # composite must not be a known direct neighbour
+        if strict_composite and composite_in_train_closure(h, r1, r2, t, train_out):
+            rejected_closure += 1
+            continue  # composite reachable via alternate train middle -> not clean
+        Q.append((int(h), int(r1), int(r2), int(t)))
+        if len(Q) >= n:
+            break
+    stats = {"n_kept": len(Q), "rejected_by_train_closure": rejected_closure,
+             "strict_composite": strict_composite}
+    return np.array(Q, dtype=np.int64), stats
+
+
+def answer_sets(Q, alltrue):
+    out = []
+    for h, r1, r2, t in Q.tolist():
+        s = set()
+        for mm in alltrue.get((h, r1), set()):
+            s |= alltrue.get((mm, r2), set())
+        out.append(s)
+    return out
+
+
+def filtered_exact_mrr(scores, Q, ansets):
+    gold = Q[:, 3]
+    ex = np.zeros(len(Q)); mrr = np.zeros(len(Q)); any_ = np.zeros(len(Q))
+    for i in range(len(Q)):
+        row = scores[i].copy()
+        any_[i] = int(row.argmax() in ansets[i])
+        for x in ansets[i]:
+            if x != int(gold[i]):
+                row[x] = -1e9
+        ex[i] = int(row.argmax() == int(gold[i]))
+        mrr[i] = 1.0 / (1 + int((row > row[int(gold[i])]).sum()))
+    return ex, mrr, any_
+
+
+def popularity_exact(Q, train, ansets):
+    pop = defaultdict(lambda: defaultdict(int))
+    for h, r, t in train.tolist():
+        pop[int(r)][int(t)] += 1
+    gold = Q[:, 3]
+    pe = []
+    for i, r2 in enumerate(Q[:, 2].tolist()):
+        d = pop[int(r2)]
+        pred = max(d, key=d.get) if d else -1
+        pe.append(int(pred == int(gold[i])))
+    return np.array(pe)
+
+
+def leak_mask(Q, train_out):
+    """Boolean mask: composite target already reachable via the train 2-hop closure."""
+    m = np.zeros(len(Q), dtype=bool)
+    for i, (h, r1, r2, t) in enumerate(Q.tolist()):
+        m[i] = composite_in_train_closure(h, r1, r2, t, train_out)
+    return m
+
+
+def composition_report(model, Q, ansets, train, pure_model=None):
+    """Report path/pure/popularity on ALL, STRICT (clean), and LEAKY subsets.
+
+    The STRICT row is the load-bearing one: composites NOT reachable via the train
+    2-hop closure, i.e. genuinely-unseen targets. The LEAKY row is memorizable.
+    """
+    train_out = build_train_out(train)
+    leak = leak_mask(Q, train_out)
+    popex = popularity_exact(Q, train, ansets)
+
+    def block(mask):
+        if not mask.any():
+            return None
+        Qs = Q[mask]; A = [ansets[i] for i in range(len(Q)) if mask[i]]
+        sc = model.composed_scores(Qs[:, 0], Qs[:, 1], Qs[:, 2])
+        ex, mrr, _ = filtered_exact_mrr(sc, Qs, A)
+        row = dict(n=int(mask.sum()), pop_exact=float(popex[mask].mean()),
+                   path_mrr=float(mrr.mean()), path_exact=float(ex.mean()))
+        if pure_model is not None:
+            scp = pure_model.composed_scores(Qs[:, 0], Qs[:, 1], Qs[:, 2])
+            _, mrrp, _ = filtered_exact_mrr(scp, Qs, A)
+            row["pure_mrr"] = float(mrrp.mean())
+        return row
+
+    return {"leaky_fraction": float(leak.mean()),
+            "all": block(np.ones(len(Q), bool)),
+            "strict_clean": block(~leak),
+            "leaky": block(leak)}
+
+
+def degree_sweep(model, Q, ansets, train, pure_model=None):
+    """Return overall + per-degree-stratum metrics. pure_model = atomic-only control."""
+    reldeg = Counter(int(r) for _, r, _ in train.tolist())
+    r2deg = np.array([reldeg[int(r)] for r in Q[:, 2]])
+    aset = np.array([len(s) for s in ansets])
+    sc = model.composed_scores(Q[:, 0], Q[:, 1], Q[:, 2])
+    exC, mrrC, anyC = filtered_exact_mrr(sc, Q, ansets)
+    popex = popularity_exact(Q, train, ansets)
+    rows = {"overall": dict(n=len(Q), path_mrr=float(mrrC.mean()),
+                            path_exact=float(exC.mean()), pop_exact=float(popex.mean()))}
+    if pure_model is not None:
+        scP = pure_model.composed_scores(Q[:, 0], Q[:, 1], Q[:, 2])
+        _, mrrP, _ = filtered_exact_mrr(scP, Q, ansets)
+        rows["overall"]["pure_mrr"] = float(mrrP.mean())
+    qs = np.quantile(r2deg, [0.33, 0.66])
+    for nm, mask in [("low_r2deg", r2deg <= qs[0]),
+                     ("mid_r2deg", (r2deg > qs[0]) & (r2deg <= qs[1])),
+                     ("high_r2deg", r2deg > qs[1])]:
+        if not mask.any():
+            continue
+        rows[nm] = dict(n=int(mask.sum()), ans_size=float(aset[mask].mean()),
+                        pop_exact=float(popex[mask].mean()),
+                        path_mrr=float(mrrC[mask].mean()),
+                        path_exact=float(exC[mask].mean()))
+        if pure_model is not None:
+            rows[nm]["pure_mrr"] = float(mrrP[mask].mean())
+    return rows

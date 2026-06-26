@@ -1,0 +1,32 @@
+"""Write auditable provenance manifests for checkpoints and results."""
+from __future__ import annotations
+import hashlib, json, os
+from pathlib import Path
+
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_manifest(checkpoint: str, *, dataset_name, dataset_url, n_entities, n_relations,
+                   dim, seed, config: dict, eval_command: str, result_json: str | None = None,
+                   dataset_files: dict | None = None):
+    ck = Path(checkpoint)
+    man = {
+        "checkpoint": ck.name,
+        "checkpoint_sha256": sha256(str(ck)),
+        "dataset_name": dataset_name,
+        "dataset_url": dataset_url,
+        "dataset_file_sha256": dataset_files or "not bundled; download from dataset_url",
+        "n_entities": n_entities, "n_relations": n_relations, "dim": dim, "seed": seed,
+        "train_config": config,
+        "eval_command": eval_command,
+        "result": json.load(open(result_json)) if result_json and os.path.exists(result_json) else None,
+    }
+    out = ck.with_suffix(ck.suffix + ".manifest.json")
+    out.write_text(json.dumps(man, indent=2))
+    return str(out)

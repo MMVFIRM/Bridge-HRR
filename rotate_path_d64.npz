@@ -1,0 +1,19 @@
+"""Bridge-HRR v5.1 — compositional geometry for two-hop KG reasoning (strict gate).
+
+Result this package reproduces, end to end:
+
+  Held-out two-hop composition on FB15k-237 is NOT recovered by holographic
+  memory (any readout), NOR by pure RotatE geometry (which sits at the
+  popularity floor). It IS recovered by geometry trained for composition:
+  a RotatE atomic objective PLUS a path-consistency objective
+  (theta_h + theta_r1 + theta_r2 -> theta_t over observed 2-hops). The
+  composed key then generalizes to unseen bridge edges via a single vector
+  add + nearest-neighbour -- no memory, no attention, no resonator.
+
+  Path-consistency training installs a SMALL BUT REAL clean-generalization
+  signal (strict-gated MRR 0.105 vs 0.082 popularity, 0.022 atomic-only). The
+  larger v5 headline was ~half inflated by composites reachable through alternate
+  train paths; see RESULTS_v5_1.md. Composition must be paid for in the objective,
+  and even then the clean payoff here is modest.
+"""
+__version__ = "5.1.0"
